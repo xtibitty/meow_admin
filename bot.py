@@ -453,9 +453,14 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = msg.text.strip()
     today = datetime.now(TZ).date()
 
-    # --- Mileage topic: any message here IS this month's mileage figure ---
+    # --- Mileage topic: only treat it as a reading if there's an actual number in it ---
     if thread_id == MILEAGE_THREAD_ID:
         reading_date, stored_text, parsed_value = parse_mileage_entry(text, today)
+        if parsed_value is None:
+            parsed_value = parse_mileage_value(stored_text)
+        if parsed_value is None:
+            return  # just chat, not a mileage reading — leave it alone
+
         record_mileage(reading_date, stored_text, parsed_value)
         reply = mileage_rebate_reply(reading_date)
         if reply:
@@ -668,6 +673,7 @@ MILEAGE_HELP_TEXT = (
     "\u2022 /setpremium <amount> \u2014 set your insurance premium, e.g. /setpremium 980\n"
     "\u2022 /setcycle <date> \u2014 set your policy cycle date, e.g. /setcycle 15/04/26\n"
     "  (nags daily for a new premium once the cycle renews, until you /setpremium)\n"
+    "\u2022 /fixmileage <YYYY-MM> <value> \u2014 correct a stored reading, e.g. /fixmileage 2026-07 86987\n"
     "\u2022 /topicid \u2014 show this topic's chat_id / thread_id\n"
     "\u2022 /help \u2014 show this message"
 )
@@ -747,6 +753,41 @@ async def cmd_setcycle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.reply_text(f"Cycle date set to {parsed.strftime('%d/%m/%y')}.")
 
 
+_YEAR_MONTH_RE = re.compile(r"^\d{4}-\d{2}$")
+
+
+async def cmd_fixmileage(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manually correct a month's stored mileage value, e.g. /fixmileage 2026-07 86987."""
+    msg = update.effective_message
+    if not msg or msg.chat_id != CHAT_ID:
+        return
+    if len(context.args) < 2:
+        await msg.reply_text(
+            "Usage: /fixmileage <YYYY-MM> <value>  e.g. /fixmileage 2026-07 86987"
+        )
+        return
+    year_month = context.args[0]
+    if not _YEAR_MONTH_RE.match(year_month):
+        await msg.reply_text("Month should be in YYYY-MM format, e.g. 2026-07")
+        return
+    try:
+        value = float(context.args[1].replace(",", ""))
+    except ValueError:
+        await msg.reply_text("That doesn't look like a number.")
+        return
+
+    conn = get_db()
+    row = conn.execute("SELECT text FROM mileage WHERE year_month=?", (year_month,)).fetchone()
+    if not row:
+        conn.close()
+        await msg.reply_text(f"No mileage record found for {year_month}.")
+        return
+    conn.execute("UPDATE mileage SET value=? WHERE year_month=?", (value, year_month))
+    conn.commit()
+    conn.close()
+    await msg.reply_text(f"Updated {year_month} mileage value to {value:.0f} km (text left as-is: \"{row[0]}\").")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -760,6 +801,7 @@ def main():
     app.add_handler(CommandHandler("summary", cmd_summary))
     app.add_handler(CommandHandler("setpremium", cmd_setpremium))
     app.add_handler(CommandHandler("setcycle", cmd_setcycle))
+    app.add_handler(CommandHandler("fixmileage", cmd_fixmileage))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
     jq = app.job_queue
