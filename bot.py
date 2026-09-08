@@ -2,7 +2,7 @@ import os
 import re
 import sqlite3
 import logging
-from datetime import datetime, date, time as dtime
+from datetime import datetime, date, time as dtime, timedelta
 from zoneinfo import ZoneInfo
 
 from telegram import Update, ReactionTypeEmoji
@@ -143,6 +143,29 @@ def set_travel_claimed(grp: str, year_month: str):
     conn.close()
 
 
+def set_all_pending_claimed(grp: str):
+    """Mark every outstanding (summarised but not claimed) month as claimed."""
+    conn = get_db()
+    conn.execute(
+        "UPDATE travel_status SET claimed=1 WHERE grp=? AND summary_sent=1 AND claimed=0",
+        (grp,),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_pending_travel_months(grp: str):
+    """All months that have a summary sent but haven't been claimed yet, oldest first."""
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT year_month, summary_text FROM travel_status "
+        "WHERE grp=? AND summary_sent=1 AND claimed=0 ORDER BY year_month",
+        (grp,),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
 def get_travel_entries(grp: str, year_month: str):
     conn = get_db()
     rows = conn.execute(
@@ -185,6 +208,50 @@ def prev_month(d: date):
     return d.year, d.month - 1
 
 
+# Leading-word/number date hints, e.g. "yesterday home > x", "20 home > x"
+_YESTERDAY_RE = re.compile(r"^yesterday\b[:\-]?\s*(.*)$", re.IGNORECASE | re.DOTALL)
+_TODAY_RE = re.compile(r"^today\b[:\-]?\s*(.*)$", re.IGNORECASE | re.DOTALL)
+_DAYNUM_RE = re.compile(r"^(\d{1,2})\b[:\-]?\s*(.*)$", re.DOTALL)
+
+
+def parse_travel_entry(raw_text: str, sent_date: date):
+    """Figure out which calendar date a travel entry refers to.
+
+    Supports:
+      "yesterday home > x > home"      -> sent_date - 1 day
+      "today home > x > home"          -> sent_date
+      "20 home > x > home"             -> day 20 of sent_date's month
+                                           (or previous month if 20 > sent_date.day,
+                                           e.g. logging the 31st on the 1st/2nd)
+      anything else (e.g. "Whole week home > kc3 > home") -> sent_date, unchanged
+    Returns (target_date, cleaned_text).
+    """
+    text = raw_text.strip()
+
+    m = _YESTERDAY_RE.match(text)
+    if m:
+        return sent_date - timedelta(days=1), m.group(1).strip()
+
+    m = _TODAY_RE.match(text)
+    if m:
+        return sent_date, m.group(1).strip()
+
+    m = _DAYNUM_RE.match(text)
+    if m:
+        day_num = int(m.group(1))
+        if 1 <= day_num <= 31:
+            year, month = sent_date.year, sent_date.month
+            if day_num > sent_date.day:
+                year, month = prev_month(sent_date)
+            try:
+                target = date(year, month, day_num)
+                return target, m.group(2).strip()
+            except ValueError:
+                pass  # not a valid day for that month — fall through
+
+    return sent_date, text
+
+
 # ---------------------------------------------------------------------------
 # Incoming messages
 # ---------------------------------------------------------------------------
@@ -222,11 +289,11 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for grp, tid in TRAVEL_GROUPS.items():
         if thread_id == tid:
             if CLAIM_KEYWORD_RE.search(text):
-                y, m = prev_month(today)
-                set_travel_claimed(grp, f"{y:04d}-{m:02d}")
-                await react_or_reply(context, msg, f"Marked {grp} transport as claimed.")
+                set_all_pending_claimed(grp)
+                await react_or_reply(context, msg, f"Marked all outstanding {grp} transport as claimed.")
             else:
-                add_travel_entry(grp, today, text)
+                target_date, cleaned_text = parse_travel_entry(text, today)
+                add_travel_entry(grp, target_date, cleaned_text or text)
                 await react_or_reply(context, msg, "Logged.")
             return
 
@@ -270,17 +337,14 @@ async def job_travel_summary_check(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def job_travel_claim_reminder(context: ContextTypes.DEFAULT_TYPE):
-    today = datetime.now(TZ).date()
-    py, pm = prev_month(today)
-    year_month = f"{py:04d}-{pm:02d}"
     for grp in TRAVEL_GROUPS:
-        status = get_travel_status(grp, year_month)
-        if not status:
+        pending = get_pending_travel_months(grp)
+        if not pending:
             continue
-        summary_sent, claimed, summary_text = status
-        if not summary_sent or claimed:
-            continue
-        text = summary_text or format_travel_summary(grp, year_month) or "CLAIM YO TRANSPORT!!"
+        parts = []
+        for year_month, summary_text in pending:
+            parts.append(summary_text or format_travel_summary(grp, year_month) or year_month)
+        text = "\n\n".join(parts)
         await context.bot.send_message(
             chat_id=CHAT_ID,
             message_thread_id=TRAVEL_GROUPS[grp],
