@@ -132,8 +132,10 @@ def _slash_date_to_date(day_str, month_str, year_str) -> date:
 
 def parse_mileage_entry(raw_text: str, sent_date: date):
     """Handles backdated mileage readings like "14/07/26 86987" or "86987 14/07/26".
-    Returns (reading_date, text_to_store). Anything that doesn't match this pattern
-    is treated as a normal reading for `sent_date` (unchanged text)."""
+    Returns (reading_date, text_to_store, value). `value` is the mileage number if we
+    can identify it unambiguously from the dated pattern, else None (caller should
+    fall back to generic number extraction on the raw text). Anything that doesn't
+    match the dated pattern returns (sent_date, unchanged text, None)."""
     text = raw_text.strip()
     normalized = re.sub(r"(?<=\d),(?=\d)", "", text)  # allow "86,987"
 
@@ -142,11 +144,12 @@ def parse_mileage_entry(raw_text: str, sent_date: date):
         if m:
             try:
                 reading_date = _slash_date_to_date(m.group("day"), m.group("month"), m.group("year"))
-                return reading_date, text
+                value = float(m.group("value"))
+                return reading_date, text, value
             except ValueError:
                 pass  # invalid date — fall through to default
 
-    return sent_date, text
+    return sent_date, text, None
 
 
 _NUMBER_RE = re.compile(r"(\d+(?:\.\d+)?)")
@@ -157,8 +160,9 @@ def parse_mileage_value(text: str):
     return float(m.group(1)) if m else None
 
 
-def record_mileage(d: date, text: str):
-    value = parse_mileage_value(text)
+def record_mileage(d: date, text: str, value=None):
+    if value is None:
+        value = parse_mileage_value(text)
     conn = get_db()
     conn.execute(
         "INSERT OR REPLACE INTO mileage (year_month, text, value, submitted_at) VALUES (?, ?, ?, ?)",
@@ -451,8 +455,8 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --- Mileage topic: any message here IS this month's mileage figure ---
     if thread_id == MILEAGE_THREAD_ID:
-        reading_date, stored_text = parse_mileage_entry(text, today)
-        record_mileage(reading_date, stored_text)
+        reading_date, stored_text, parsed_value = parse_mileage_entry(text, today)
+        record_mileage(reading_date, stored_text, parsed_value)
         reply = mileage_rebate_reply(reading_date)
         if reply:
             await msg.reply_text(reply)
