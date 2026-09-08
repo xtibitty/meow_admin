@@ -289,7 +289,7 @@ async def job_travel_claim_reminder(context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
-# Setup helper command
+# Setup / query commands
 # ---------------------------------------------------------------------------
 
 async def cmd_topicid(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -297,6 +297,49 @@ async def cmd_topicid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.reply_text(
         f"chat_id: {msg.chat_id}\nmessage_thread_id: {msg.message_thread_id}"
     )
+
+
+def mileage_summary_text(d: date) -> str:
+    conn = get_db()
+    row = conn.execute(
+        "SELECT text FROM mileage WHERE year_month=?", (ym(d),)
+    ).fetchone()
+    conn.close()
+    if row:
+        return f"Mileage recorded this month: {row[0]}"
+    return "No mileage recorded yet this month."
+
+
+def travel_summary_text(grp: str, d: date) -> str:
+    entries = get_travel_entries(grp, ym(d))
+    if not entries:
+        return f"{grp}: no trips logged yet this month."
+    lines = [f"{grp} trips logged so far this month:"]
+    for day, text in entries:
+        lines.append(f"{day:02d} {text}")
+    return "\n".join(lines)
+
+
+async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if not msg or msg.chat_id != CHAT_ID:
+        return
+    thread_id = msg.message_thread_id
+    today = datetime.now(TZ).date()
+
+    if thread_id == MILEAGE_THREAD_ID:
+        text = mileage_summary_text(today)
+    else:
+        grp = next((g for g, tid in TRAVEL_GROUPS.items() if tid == thread_id), None)
+        if grp:
+            text = travel_summary_text(grp, today)
+        else:
+            # asked outside a recognised topic — give everything
+            parts = [mileage_summary_text(today)]
+            parts.extend(travel_summary_text(g, today) for g in TRAVEL_GROUPS)
+            text = "\n\n".join(parts)
+
+    await msg.reply_text(text)
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -312,6 +355,7 @@ def main():
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("topicid", cmd_topicid))
+    app.add_handler(CommandHandler("summary", cmd_summary))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
     jq = app.job_queue
