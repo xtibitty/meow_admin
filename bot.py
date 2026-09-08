@@ -48,6 +48,14 @@ MONTH_NAMES = [
     "august", "september", "october", "november", "december",
 ]
 
+# Mileage rebate tiers: (avg km/day upper bound, daily rebate rate as a decimal)
+# < 14 km/day -> 0.08%, < 22 km/day -> 0.06%, < 33 km/day -> 0.03%, else 0%
+MILEAGE_REBATE_TIERS = [
+    (14, 0.0008),
+    (22, 0.0006),
+    (33, 0.0003),
+]
+
 # ---------------------------------------------------------------------------
 # DB helpers
 # ---------------------------------------------------------------------------
@@ -75,6 +83,15 @@ def get_db():
         summary_text TEXT,
         PRIMARY KEY (grp, year_month)
     )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS mileage_settings (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        premium REAL,
+        cycle_date TEXT
+    )""")
+    # Migrate older DBs that don't have the numeric `value` column yet.
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(mileage)").fetchall()]
+    if "value" not in cols:
+        conn.execute("ALTER TABLE mileage ADD COLUMN value REAL")
     return conn
 
 
@@ -89,14 +106,92 @@ def is_mileage_submitted(d: date) -> bool:
     return row is not None
 
 
+_NUMBER_RE = re.compile(r"(\d+(?:\.\d+)?)")
+
+
+def parse_mileage_value(text: str):
+    m = _NUMBER_RE.search(text.replace(",", ""))
+    return float(m.group(1)) if m else None
+
+
 def record_mileage(d: date, text: str):
+    value = parse_mileage_value(text)
     conn = get_db()
     conn.execute(
-        "INSERT OR REPLACE INTO mileage (year_month, text, submitted_at) VALUES (?, ?, ?)",
-        (ym(d), text, datetime.now(TZ).isoformat()),
+        "INSERT OR REPLACE INTO mileage (year_month, text, value, submitted_at) VALUES (?, ?, ?, ?)",
+        (ym(d), text, value, datetime.now(TZ).isoformat()),
     )
     conn.commit()
     conn.close()
+
+
+def get_previous_mileage(year_month: str):
+    """Most recent mileage record strictly before the given month."""
+    conn = get_db()
+    row = conn.execute(
+        "SELECT year_month, value, submitted_at FROM mileage "
+        "WHERE year_month < ? AND value IS NOT NULL ORDER BY year_month DESC LIMIT 1",
+        (year_month,),
+    ).fetchone()
+    conn.close()
+    return row
+
+
+def get_mileage_settings():
+    conn = get_db()
+    row = conn.execute("SELECT premium, cycle_date FROM mileage_settings WHERE id=1").fetchone()
+    conn.close()
+    if not row:
+        return None, None
+    return row[0], row[1]
+
+
+def set_premium(value: float):
+    conn = get_db()
+    conn.execute(
+        """INSERT INTO mileage_settings (id, premium) VALUES (1, ?)
+           ON CONFLICT(id) DO UPDATE SET premium=excluded.premium""",
+        (value,),
+    )
+    conn.commit()
+    conn.close()
+
+
+def set_cycle_date(iso_date: str):
+    conn = get_db()
+    conn.execute(
+        """INSERT INTO mileage_settings (id, cycle_date) VALUES (1, ?)
+           ON CONFLICT(id) DO UPDATE SET cycle_date=excluded.cycle_date""",
+        (iso_date,),
+    )
+    conn.commit()
+    conn.close()
+
+
+def rebate_rate_for(avg_daily_km: float) -> float:
+    for cap, rate in MILEAGE_REBATE_TIERS:
+        if avg_daily_km < cap:
+            return rate
+    return 0.0  # 33+ km/day — no tier specified, assumed no rebate
+
+
+def compute_mileage_rebate(current_value, current_submitted_at, previous_row, premium):
+    """Returns (rebate_amount, avg_daily_km, rate, days) or None if not computable."""
+    if previous_row is None or current_value is None or premium is None:
+        return None
+    _, prev_value, prev_submitted_at = previous_row
+    if prev_value is None:
+        return None
+    current_date = datetime.fromisoformat(current_submitted_at).date()
+    prev_date = datetime.fromisoformat(prev_submitted_at).date()
+    days = (current_date - prev_date).days
+    if days <= 0:
+        return None
+    diff = current_value - prev_value
+    avg_daily_km = diff / days
+    rate = rebate_rate_for(avg_daily_km)
+    rebate = avg_daily_km * rate * premium
+    return rebate, avg_daily_km, rate, days
 
 
 def add_travel_entry(grp: str, d: date, text: str):
@@ -282,7 +377,11 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # --- Mileage topic: any message here IS this month's mileage figure ---
     if thread_id == MILEAGE_THREAD_ID:
         record_mileage(today, text)
-        await react_or_reply(context, msg, "Mileage recorded for this month, thanks!")
+        reply = mileage_rebate_reply(today)
+        if reply:
+            await msg.reply_text(reply)
+        else:
+            await react_or_reply(context, msg, "Mileage recorded for this month, thanks!")
         return
 
     # --- Travel topics ---
@@ -366,12 +465,60 @@ async def cmd_topicid(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def mileage_summary_text(d: date) -> str:
     conn = get_db()
     row = conn.execute(
-        "SELECT text FROM mileage WHERE year_month=?", (ym(d),)
+        "SELECT text, value, submitted_at FROM mileage WHERE year_month=?", (ym(d),)
     ).fetchone()
     conn.close()
-    if row:
-        return f"Mileage recorded this month: {row[0]}"
-    return "No mileage recorded yet this month."
+    if not row:
+        return "No mileage recorded yet this month."
+
+    text, value, submitted_at = row
+    lines = [f"Mileage recorded this month: {text}"]
+    premium, cycle_date = get_mileage_settings()
+    if premium is not None:
+        previous = get_previous_mileage(ym(d))
+        result = compute_mileage_rebate(value, submitted_at, previous, premium)
+        if result:
+            rebate, avg_daily_km, rate, days = result
+            lines.append(
+                f"Est. rebate: ${rebate:.2f} ({avg_daily_km:.2f} km/day avg over {days} days, "
+                f"{rate * 100:.2f}% tier)"
+            )
+    if cycle_date:
+        lines.append(f"Cycle date: {cycle_date}")
+    return "\n".join(lines)
+
+
+def mileage_rebate_reply(d: date) -> str:
+    """Called right after a new mileage submission — returns a rebate message,
+    or None if there isn't enough data yet to compute one."""
+    conn = get_db()
+    row = conn.execute(
+        "SELECT value, submitted_at FROM mileage WHERE year_month=?", (ym(d),)
+    ).fetchone()
+    conn.close()
+    if not row:
+        return None
+    value, submitted_at = row
+    if value is None:
+        return None  # couldn't parse a number out of the message
+
+    previous = get_previous_mileage(ym(d))
+    if previous is None:
+        return None  # need at least two records
+
+    premium, _ = get_mileage_settings()
+    if premium is None:
+        return "Mileage recorded! Set your premium with /setpremium <amount> so I can estimate your rebate."
+
+    result = compute_mileage_rebate(value, submitted_at, previous, premium)
+    if not result:
+        return None
+    rebate, avg_daily_km, rate, days = result
+    return (
+        f"Mileage recorded: {previous[1]:.0f} km \u2192 {value:.0f} km over {days} days\n"
+        f"Avg {avg_daily_km:.2f} km/day \u2192 {rate * 100:.2f}% tier\n"
+        f"Estimated rebate: ${rebate:.2f}"
+    )
 
 
 def travel_summary_text(grp: str, d: date) -> str:
@@ -410,6 +557,90 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("Admin bot is running.")
 
 
+MILEAGE_HELP_TEXT = (
+    "Mileage topic commands:\n"
+    "\u2022 Just send a number \u2014 records this month's mileage reading\n"
+    "\u2022 /summary \u2014 this month's mileage + rebate estimate\n"
+    "\u2022 /setpremium <amount> \u2014 set your insurance premium, e.g. /setpremium 980\n"
+    "\u2022 /setcycle <date> \u2014 set your policy cycle date, e.g. /setcycle 2026-04-15\n"
+    "\u2022 /topicid \u2014 show this topic's chat_id / thread_id\n"
+    "\u2022 /help \u2014 show this message"
+)
+
+TRAVEL_HELP_TEXT = (
+    "{grp} travel topic commands:\n"
+    "\u2022 Just send your trip, e.g. \"home > kc3 > home\" \u2014 logs it under today's date\n"
+    "\u2022 \"yesterday ...\" / \"today ...\" / \"20 ...\" \u2014 logs under a specific date\n"
+    "\u2022 /summary \u2014 trips logged so far this month\n"
+    "\u2022 Reply with \"claim\" / \"claimed\" \u2014 marks all outstanding months as claimed\n"
+    "\u2022 /topicid \u2014 show this topic's chat_id / thread_id\n"
+    "\u2022 /help \u2014 show this message"
+)
+
+GENERAL_HELP_TEXT = (
+    "Admin bot commands:\n"
+    "\u2022 /summary \u2014 recorded mileage or trips\n"
+    "\u2022 /setpremium <amount> \u2014 set insurance premium (mileage topic)\n"
+    "\u2022 /setcycle <date> \u2014 set policy cycle date (mileage topic)\n"
+    "\u2022 /topicid \u2014 show chat_id / thread_id\n"
+    "\u2022 /help \u2014 this message\n\n"
+    "Send /help inside the mileage, JY, or HYX topic for topic-specific commands."
+)
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if not msg or msg.chat_id != CHAT_ID:
+        return
+    thread_id = msg.message_thread_id
+
+    if thread_id == MILEAGE_THREAD_ID:
+        text = MILEAGE_HELP_TEXT
+    else:
+        grp = next((g for g, tid in TRAVEL_GROUPS.items() if tid == thread_id), None)
+        text = TRAVEL_HELP_TEXT.format(grp=grp) if grp else GENERAL_HELP_TEXT
+
+    await msg.reply_text(text)
+
+
+async def cmd_setpremium(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if not msg or msg.chat_id != CHAT_ID:
+        return
+    if not context.args:
+        await msg.reply_text("Usage: /setpremium <amount>  e.g. /setpremium 980")
+        return
+    try:
+        value = float(context.args[0].replace(",", ""))
+    except ValueError:
+        await msg.reply_text("That doesn't look like a number. Usage: /setpremium 980")
+        return
+    set_premium(value)
+    await msg.reply_text(f"Premium set to ${value:.2f}.")
+
+
+async def cmd_setcycle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if not msg or msg.chat_id != CHAT_ID:
+        return
+    if not context.args:
+        await msg.reply_text("Usage: /setcycle YYYY-MM-DD  e.g. /setcycle 2026-04-15")
+        return
+    raw = context.args[0]
+    parsed = None
+    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y"):
+        try:
+            parsed = datetime.strptime(raw, fmt).date()
+            break
+        except ValueError:
+            continue
+    if not parsed:
+        await msg.reply_text("Couldn't parse that date. Try YYYY-MM-DD, e.g. /setcycle 2026-04-15")
+        return
+    set_cycle_date(parsed.isoformat())
+    await msg.reply_text(f"Cycle date set to {parsed.isoformat()}.")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -418,8 +649,11 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("topicid", cmd_topicid))
     app.add_handler(CommandHandler("summary", cmd_summary))
+    app.add_handler(CommandHandler("setpremium", cmd_setpremium))
+    app.add_handler(CommandHandler("setcycle", cmd_setcycle))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
     jq = app.job_queue
