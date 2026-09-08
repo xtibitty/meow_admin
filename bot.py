@@ -247,7 +247,8 @@ def rebate_rate_for(avg_daily_km: float) -> float:
 
 
 def compute_mileage_rebate(current_value, current_submitted_at, previous_row, premium):
-    """Returns (rebate_amount, avg_daily_km, rate, days) or None if not computable."""
+    """Returns (rebate_amount, avg_daily_km, rate, days) or None if not computable.
+    avg_daily_km is used only to pick the tier; the payout itself is rate * premium * days."""
     if previous_row is None or current_value is None or premium is None:
         return None
     _, prev_value, prev_submitted_at = previous_row
@@ -261,7 +262,7 @@ def compute_mileage_rebate(current_value, current_submitted_at, previous_row, pr
     diff = current_value - prev_value
     avg_daily_km = diff / days
     rate = rebate_rate_for(avg_daily_km)
-    rebate = avg_daily_km * rate * premium
+    rebate = rate * premium * days
     return rebate, avg_daily_km, rate, days
 
 
