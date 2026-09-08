@@ -35,6 +35,7 @@ DB_PATH = os.environ.get("DB_PATH", "/data/admin_bot.db")
 MILEAGE_REMINDER_TIME = dtime(17, 30, tzinfo=TZ)   # 5:30pm daily from the 3rd
 TRAVEL_CHECK_TIME = dtime(8, 0, tzinfo=TZ)          # when to check "is it 1st Saturday"
 TRAVEL_REMINDER_TIME = dtime(9, 0, tzinfo=TZ)       # daily "claim your transport" nag
+CYCLE_CHECK_TIME = dtime(9, 15, tzinfo=TZ)          # daily check for policy cycle renewal
 
 CLAIM_KEYWORD_RE = re.compile(r"\bclaim(ed)?\b", re.IGNORECASE)
 
@@ -86,12 +87,19 @@ def get_db():
     conn.execute("""CREATE TABLE IF NOT EXISTS mileage_settings (
         id INTEGER PRIMARY KEY CHECK (id = 1),
         premium REAL,
-        cycle_date TEXT
+        cycle_date TEXT,
+        cycle_year_processed INTEGER,
+        premium_confirmed INTEGER DEFAULT 1
     )""")
     # Migrate older DBs that don't have the numeric `value` column yet.
     cols = [r[1] for r in conn.execute("PRAGMA table_info(mileage)").fetchall()]
     if "value" not in cols:
         conn.execute("ALTER TABLE mileage ADD COLUMN value REAL")
+    settings_cols = [r[1] for r in conn.execute("PRAGMA table_info(mileage_settings)").fetchall()]
+    if "cycle_year_processed" not in settings_cols:
+        conn.execute("ALTER TABLE mileage_settings ADD COLUMN cycle_year_processed INTEGER")
+    if "premium_confirmed" not in settings_cols:
+        conn.execute("ALTER TABLE mileage_settings ADD COLUMN premium_confirmed INTEGER DEFAULT 1")
     return conn
 
 
@@ -104,6 +112,41 @@ def is_mileage_submitted(d: date) -> bool:
     row = conn.execute("SELECT 1 FROM mileage WHERE year_month=?", (ym(d),)).fetchone()
     conn.close()
     return row is not None
+
+
+# Mileage entries with an explicit backdated date, DD/MM/YY (or DD/MM/YYYY), e.g.
+# "14/07/26 86987" or "86987 14/07/26"
+_SLASH_DATE = r"(?P<day>\d{1,2})/(?P<month>\d{1,2})/(?P<year>\d{2}|\d{4})"
+_SLASH_VALUE = r"(?P<value>\d+(?:\.\d+)?)"
+
+_SLASH_DATE_FIRST_RE = re.compile(rf"^{_SLASH_DATE}\s+{_SLASH_VALUE}\s*(?:km)?\s*$", re.IGNORECASE)
+_SLASH_VALUE_FIRST_RE = re.compile(rf"^{_SLASH_VALUE}\s*(?:km)?\s+{_SLASH_DATE}\s*$", re.IGNORECASE)
+
+
+def _slash_date_to_date(day_str, month_str, year_str) -> date:
+    day, month, year = int(day_str), int(month_str), int(year_str)
+    if len(year_str) == 2:
+        year += 2000
+    return date(year, month, day)
+
+
+def parse_mileage_entry(raw_text: str, sent_date: date):
+    """Handles backdated mileage readings like "14/07/26 86987" or "86987 14/07/26".
+    Returns (reading_date, text_to_store). Anything that doesn't match this pattern
+    is treated as a normal reading for `sent_date` (unchanged text)."""
+    text = raw_text.strip()
+    normalized = re.sub(r"(?<=\d),(?=\d)", "", text)  # allow "86,987"
+
+    for rx in (_SLASH_DATE_FIRST_RE, _SLASH_VALUE_FIRST_RE):
+        m = rx.match(normalized)
+        if m:
+            try:
+                reading_date = _slash_date_to_date(m.group("day"), m.group("month"), m.group("year"))
+                return reading_date, text
+            except ValueError:
+                pass  # invalid date — fall through to default
+
+    return sent_date, text
 
 
 _NUMBER_RE = re.compile(r"(\d+(?:\.\d+)?)")
@@ -119,7 +162,7 @@ def record_mileage(d: date, text: str):
     conn = get_db()
     conn.execute(
         "INSERT OR REPLACE INTO mileage (year_month, text, value, submitted_at) VALUES (?, ?, ?, ?)",
-        (ym(d), text, value, datetime.now(TZ).isoformat()),
+        (ym(d), text, value, d.isoformat()),
     )
     conn.commit()
     conn.close()
@@ -149,9 +192,33 @@ def get_mileage_settings():
 def set_premium(value: float):
     conn = get_db()
     conn.execute(
-        """INSERT INTO mileage_settings (id, premium) VALUES (1, ?)
-           ON CONFLICT(id) DO UPDATE SET premium=excluded.premium""",
+        """INSERT INTO mileage_settings (id, premium, premium_confirmed) VALUES (1, ?, 1)
+           ON CONFLICT(id) DO UPDATE SET premium=excluded.premium, premium_confirmed=1""",
         (value,),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_cycle_tracking():
+    """Returns (cycle_date_str, cycle_year_processed, premium_confirmed)."""
+    conn = get_db()
+    row = conn.execute(
+        "SELECT cycle_date, cycle_year_processed, premium_confirmed FROM mileage_settings WHERE id=1"
+    ).fetchone()
+    conn.close()
+    if not row:
+        return None, None, None
+    return row[0], row[1], row[2]
+
+
+def set_cycle_tracking(cycle_year_processed: int, premium_confirmed: int):
+    conn = get_db()
+    conn.execute(
+        """INSERT INTO mileage_settings (id, cycle_year_processed, premium_confirmed) VALUES (1, ?, ?)
+           ON CONFLICT(id) DO UPDATE SET cycle_year_processed=excluded.cycle_year_processed,
+                                          premium_confirmed=excluded.premium_confirmed""",
+        (cycle_year_processed, premium_confirmed),
     )
     conn.commit()
     conn.close()
@@ -303,6 +370,14 @@ def prev_month(d: date):
     return d.year, d.month - 1
 
 
+def elapsed_cycle_years(cycle_date: date, today: date) -> int:
+    """How many full policy-year anniversaries of cycle_date have passed by today."""
+    years = today.year - cycle_date.year
+    if (today.month, today.day) < (cycle_date.month, cycle_date.day):
+        years -= 1
+    return years
+
+
 # Leading-word/number date hints, e.g. "yesterday home > x", "20 home > x"
 _YESTERDAY_RE = re.compile(r"^yesterday\b[:\-]?\s*(.*)$", re.IGNORECASE | re.DOTALL)
 _TODAY_RE = re.compile(r"^today\b[:\-]?\s*(.*)$", re.IGNORECASE | re.DOTALL)
@@ -376,12 +451,13 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --- Mileage topic: any message here IS this month's mileage figure ---
     if thread_id == MILEAGE_THREAD_ID:
-        record_mileage(today, text)
-        reply = mileage_rebate_reply(today)
+        reading_date, stored_text = parse_mileage_entry(text, today)
+        record_mileage(reading_date, stored_text)
+        reply = mileage_rebate_reply(reading_date)
         if reply:
             await msg.reply_text(reply)
         else:
-            await react_or_reply(context, msg, "Mileage recorded for this month, thanks!")
+            await react_or_reply(context, msg, "Mileage recorded, thanks!")
         return
 
     # --- Travel topics ---
@@ -448,6 +524,29 @@ async def job_travel_claim_reminder(context: ContextTypes.DEFAULT_TYPE):
             chat_id=CHAT_ID,
             message_thread_id=TRAVEL_GROUPS[grp],
             text=text,
+        )
+
+
+async def job_cycle_check(context: ContextTypes.DEFAULT_TYPE):
+    cycle_date_str, cycle_year_processed, premium_confirmed = get_cycle_tracking()
+    if not cycle_date_str:
+        return
+    cycle_date = datetime.strptime(cycle_date_str, "%d/%m/%y").date()
+    today = datetime.now(TZ).date()
+    current_elapsed = elapsed_cycle_years(cycle_date, today)
+
+    if current_elapsed > (cycle_year_processed or 0):
+        set_cycle_tracking(current_elapsed, 0)
+        premium_confirmed = 0
+
+    if not premium_confirmed:
+        await context.bot.send_message(
+            chat_id=CHAT_ID,
+            message_thread_id=MILEAGE_THREAD_ID,
+            text=(
+                "Your policy cycle has renewed! Please set your new premium "
+                "with /setpremium <amount>."
+            ),
         )
 
 
@@ -560,9 +659,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 MILEAGE_HELP_TEXT = (
     "Mileage topic commands:\n"
     "\u2022 Just send a number \u2014 records this month's mileage reading\n"
+    "\u2022 \"14/07/26 86987\" \u2014 backdates a reading to a specific date\n"
     "\u2022 /summary \u2014 this month's mileage + rebate estimate\n"
     "\u2022 /setpremium <amount> \u2014 set your insurance premium, e.g. /setpremium 980\n"
-    "\u2022 /setcycle <date> \u2014 set your policy cycle date, e.g. /setcycle 2026-04-15\n"
+    "\u2022 /setcycle <date> \u2014 set your policy cycle date, e.g. /setcycle 15/04/26\n"
+    "  (nags daily for a new premium once the cycle renews, until you /setpremium)\n"
     "\u2022 /topicid \u2014 show this topic's chat_id / thread_id\n"
     "\u2022 /help \u2014 show this message"
 )
@@ -624,21 +725,22 @@ async def cmd_setcycle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg or msg.chat_id != CHAT_ID:
         return
     if not context.args:
-        await msg.reply_text("Usage: /setcycle YYYY-MM-DD  e.g. /setcycle 2026-04-15")
+        await msg.reply_text("Usage: /setcycle DD/MM/YY  e.g. /setcycle 15/04/26")
         return
     raw = context.args[0]
     parsed = None
-    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y"):
+    for fmt in ("%d/%m/%y", "%d/%m/%Y", "%Y-%m-%d"):
         try:
             parsed = datetime.strptime(raw, fmt).date()
             break
         except ValueError:
             continue
     if not parsed:
-        await msg.reply_text("Couldn't parse that date. Try YYYY-MM-DD, e.g. /setcycle 2026-04-15")
+        await msg.reply_text("Couldn't parse that date. Try DD/MM/YY, e.g. /setcycle 15/04/26")
         return
-    set_cycle_date(parsed.isoformat())
-    await msg.reply_text(f"Cycle date set to {parsed.isoformat()}.")
+    set_cycle_date(parsed.strftime("%d/%m/%y"))
+    set_cycle_tracking(elapsed_cycle_years(parsed, datetime.now(TZ).date()), 1)
+    await msg.reply_text(f"Cycle date set to {parsed.strftime('%d/%m/%y')}.")
 
 
 # ---------------------------------------------------------------------------
@@ -660,6 +762,7 @@ def main():
     jq.run_daily(job_mileage_reminder, time=MILEAGE_REMINDER_TIME, name="mileage_reminder")
     jq.run_daily(job_travel_summary_check, time=TRAVEL_CHECK_TIME, name="travel_summary_check")
     jq.run_daily(job_travel_claim_reminder, time=TRAVEL_REMINDER_TIME, name="travel_claim_reminder")
+    jq.run_daily(job_cycle_check, time=CYCLE_CHECK_TIME, name="cycle_check")
 
     log.info("Bot starting...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
