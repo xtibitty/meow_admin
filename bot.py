@@ -5,11 +5,12 @@ import logging
 from datetime import datetime, date, time as dtime, timedelta
 from zoneinfo import ZoneInfo
 
-from telegram import Update, ReactionTypeEmoji
+from telegram import Update, ReactionTypeEmoji, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
@@ -247,8 +248,10 @@ def rebate_rate_for(avg_daily_km: float) -> float:
 
 
 def compute_mileage_rebate(current_value, current_submitted_at, previous_row, premium):
-    """Returns (rebate_amount, avg_daily_km, rate, days) or None if not computable.
-    avg_daily_km is used only to pick the tier; the payout itself is rate * premium * days."""
+    """Returns (rebate_amount, avg_daily_km, rate, days, billable_days) or None if not computable.
+    avg_daily_km (over the full elapsed days) is used only to pick the tier;
+    the payout itself is rate * premium * billable_days, where billable_days = days - 1
+    (the first day is the baseline reading, not a rebate-eligible day)."""
     if previous_row is None or current_value is None or premium is None:
         return None
     _, prev_value, prev_submitted_at = previous_row
@@ -262,8 +265,9 @@ def compute_mileage_rebate(current_value, current_submitted_at, previous_row, pr
     diff = current_value - prev_value
     avg_daily_km = diff / days
     rate = rebate_rate_for(avg_daily_km)
-    rebate = rate * premium * days
-    return rebate, avg_daily_km, rate, days
+    billable_days = max(days - 1, 0)
+    rebate = rate * premium * billable_days
+    return rebate, avg_daily_km, rate, days, billable_days
 
 
 def add_travel_entry(grp: str, d: date, text: str):
@@ -341,6 +345,57 @@ def get_travel_entries(grp: str, year_month: str):
     ).fetchall()
     conn.close()
     return rows
+
+
+# --- helpers for the /delete inline-button flow ---
+
+def get_deletable_months(grp: str):
+    """Months with at least one entry that hasn't been claimed yet (or hasn't
+    even been summarised yet), oldest first."""
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT DISTINCT tl.year_month FROM travel_log tl "
+        "LEFT JOIN travel_status ts ON ts.grp = tl.grp AND ts.year_month = tl.year_month "
+        "WHERE tl.grp=? AND COALESCE(ts.claimed, 0) = 0 "
+        "ORDER BY tl.year_month",
+        (grp,),
+    ).fetchall()
+    conn.close()
+    return [r[0] for r in rows]
+
+
+def get_days_for_month(grp: str, year_month: str):
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT DISTINCT day FROM travel_log WHERE grp=? AND year_month=? ORDER BY day",
+        (grp, year_month),
+    ).fetchall()
+    conn.close()
+    return [r[0] for r in rows]
+
+
+def get_entries_for_day(grp: str, year_month: str, day: int):
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT id, text FROM travel_log WHERE grp=? AND year_month=? AND day=? ORDER BY id",
+        (grp, year_month, day),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def get_entry_text(entry_id: int):
+    conn = get_db()
+    row = conn.execute("SELECT text FROM travel_log WHERE id=?", (entry_id,)).fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def delete_entry(entry_id: int):
+    conn = get_db()
+    conn.execute("DELETE FROM travel_log WHERE id=?", (entry_id,))
+    conn.commit()
+    conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -476,10 +531,12 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if CLAIM_KEYWORD_RE.search(text):
                 set_all_pending_claimed(grp)
                 await react_or_reply(context, msg, f"Marked all outstanding {grp} transport as claimed.")
-            else:
+            elif text.count(">") >= 2:
                 target_date, cleaned_text = parse_travel_entry(text, today)
                 add_travel_entry(grp, target_date, cleaned_text or text)
                 await react_or_reply(context, msg, "Logged.")
+            # else: doesn't look like a trip (needs at least two ">") and isn't a
+            # claim keyword — leave it alone, no record, no reaction
             return
 
 
@@ -587,10 +644,10 @@ def mileage_summary_text(d: date) -> str:
         previous = get_previous_mileage(ym(d))
         result = compute_mileage_rebate(value, submitted_at, previous, premium)
         if result:
-            rebate, avg_daily_km, rate, days = result
+            rebate, avg_daily_km, rate, days, billable_days = result
             lines.append(
                 f"Est. rebate: ${rebate:.2f} ({avg_daily_km:.2f} km/day avg over {days} days, "
-                f"{rate * 100:.2f}% tier)"
+                f"{rate * 100:.2f}% tier, {billable_days} rebate day(s))"
             )
     if cycle_date:
         lines.append(f"Cycle date: {cycle_date}")
@@ -622,22 +679,60 @@ def mileage_rebate_reply(d: date) -> str:
     result = compute_mileage_rebate(value, submitted_at, previous, premium)
     if not result:
         return None
-    rebate, avg_daily_km, rate, days = result
+    rebate, avg_daily_km, rate, days, billable_days = result
     return (
         f"Mileage recorded: {previous[1]:.0f} km \u2192 {value:.0f} km over {days} days\n"
         f"Avg {avg_daily_km:.2f} km/day \u2192 {rate * 100:.2f}% tier\n"
-        f"Estimated rebate: ${rebate:.2f}"
+        f"Estimated rebate: ${rebate:.2f} ({billable_days} rebate day(s))"
     )
 
 
-def travel_summary_text(grp: str, d: date) -> str:
-    entries = get_travel_entries(grp, ym(d))
+def months_back(d: date, n: int) -> date:
+    """Returns a date in the same day-of-month, n calendar months before d
+    (only .year/.month matter for our purposes; day is pinned to 1 to avoid
+    end-of-month overflow issues)."""
+    year, month = d.year, d.month
+    for _ in range(n):
+        year, month = prev_month(date(year, month, 1))
+    return date(year, month, 1)
+
+
+def recent_year_months(today: date, count: int = 3):
+    """The current month plus the `count - 1` months before it, oldest first."""
+    return [ym(months_back(today, i)) for i in range(count - 1, -1, -1)]
+
+
+def travel_summary_text(grp: str, year_month: str, is_current: bool) -> str:
+    entries = get_travel_entries(grp, year_month)
+    label = month_label(year_month)
     if not entries:
-        return f"{grp}: no trips logged yet this month."
-    lines = [f"{grp} trips logged so far this month:"]
+        if is_current:
+            return f"{grp}: no trips logged yet this month ({label})."
+        return f"{grp}: no trips logged for {label}."
+    when = "so far this month" if is_current else "logged"
+    lines = [f"{grp} trips {when} ({label}):"]
     for day, text in entries:
         lines.append(f"{day:02d} {text}")
     return "\n".join(lines)
+
+
+_MONTHS_BACK_RE = re.compile(r"^-?\d{1,2}$")
+
+
+async def show_summary_month_picker(target, grp: str, today: date):
+    valid_months = recent_year_months(today, 3)  # oldest..newest
+    buttons = [[
+        InlineKeyboardButton(
+            month_label(m) + (" (this month)" if m == ym(today) else ""),
+            callback_data=f"tsum:{grp}:{m}",
+        )
+    ] for m in reversed(valid_months)]  # newest first, easiest to tap
+    await _reply_or_edit(target, f"{grp} summary — which month?", reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def send_travel_summary(target, grp: str, target_ym: str, today: date):
+    text = travel_summary_text(grp, target_ym, is_current=(target_ym == ym(today)))
+    await _reply_or_edit(target, text)
 
 
 async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -648,18 +743,188 @@ async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     today = datetime.now(TZ).date()
 
     if thread_id == MILEAGE_THREAD_ID:
-        text = mileage_summary_text(today)
-    else:
-        grp = next((g for g, tid in TRAVEL_GROUPS.items() if tid == thread_id), None)
-        if grp:
-            text = travel_summary_text(grp, today)
-        else:
-            # asked outside a recognised topic — give everything
-            parts = [mileage_summary_text(today)]
-            parts.extend(travel_summary_text(g, today) for g in TRAVEL_GROUPS)
-            text = "\n\n".join(parts)
+        await msg.reply_text(mileage_summary_text(today))
+        return
 
-    await msg.reply_text(text)
+    grp = next((g for g, tid in TRAVEL_GROUPS.items() if tid == thread_id), None)
+    if grp:
+        # /summary                -> pick a month via buttons
+        # /summary 1               -> 1 month ago, straight away
+        # /summary 2               -> 2 months ago (oldest we keep), straight away
+        # /summary YYYY-MM         -> that exact month, if within the last 3, straight away
+        if not context.args:
+            await show_summary_month_picker(msg, grp, today)
+            return
+
+        valid_months = recent_year_months(today, 3)  # oldest..newest
+        arg = context.args[0].strip()
+        if _MONTHS_BACK_RE.match(arg):
+            n = abs(int(arg))
+            if n > 2:
+                await msg.reply_text(
+                    "I only keep up to 3 months of travel data — try 0 (this month), "
+                    "1, or 2 months back."
+                )
+                return
+            target_ym = ym(months_back(today, n))
+        elif _YEAR_MONTH_RE.match(arg):
+            target_ym = arg
+        else:
+            await msg.reply_text(
+                "Usage: /summary [months back | YYYY-MM]\n"
+                "e.g. /summary, /summary 1, /summary 2026-07 (up to 3 months back)"
+            )
+            return
+
+        if target_ym not in valid_months:
+            await msg.reply_text(
+                f"I only keep up to 3 months of travel data — the oldest I have is "
+                f"{month_label(valid_months[0])}."
+            )
+            return
+
+        await send_travel_summary(msg, grp, target_ym, today)
+        return
+
+    # asked outside a recognised topic — give everything (current month only)
+    parts = [mileage_summary_text(today)]
+    parts.extend(travel_summary_text(g, ym(today), is_current=True) for g in TRAVEL_GROUPS)
+    await msg.reply_text("\n\n".join(parts))
+
+
+async def on_summary_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query or not query.data or not query.data.startswith("tsum:"):
+        return
+    if not query.message or query.message.chat_id != CHAT_ID:
+        return
+    await query.answer()
+
+    _, grp, target_ym = query.data.split(":")
+    today = datetime.now(TZ).date()
+    await send_travel_summary(query, grp, target_ym, today)
+
+
+def month_label(year_month: str) -> str:
+    y, m = year_month.split("-")
+    return f"{MONTH_NAMES[int(m) - 1].capitalize()} {y}"
+
+
+def truncate(text: str, n: int = 40) -> str:
+    return text if len(text) <= n else text[: n - 1] + "\u2026"
+
+
+async def _reply_or_edit(target, text: str, reply_markup=None):
+    """`target` is either a Message (first /delete call) or a CallbackQuery
+    (subsequent steps) — edit in place for callbacks so the flow feels like
+    one message updating, rather than a growing chat log."""
+    if hasattr(target, "edit_message_text"):
+        await target.edit_message_text(text, reply_markup=reply_markup)
+    else:
+        await target.reply_text(text, reply_markup=reply_markup)
+
+
+async def show_month_picker(target, grp: str):
+    months = get_deletable_months(grp)
+    if not months:
+        await _reply_or_edit(target, f"No deletable {grp} entries found.")
+        return
+    if len(months) == 1:
+        await show_day_picker(target, grp, months[0])
+        return
+    buttons = [
+        [InlineKeyboardButton(month_label(m), callback_data=f"tdel:month:{grp}:{m}")]
+        for m in months
+    ]
+    await _reply_or_edit(target, f"Delete a {grp} entry \u2014 which month?", reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def show_day_picker(target, grp: str, year_month: str):
+    days = get_days_for_month(grp, year_month)
+    if not days:
+        await _reply_or_edit(target, f"No entries left for {month_label(year_month)}.")
+        return
+    if len(days) == 1:
+        await show_entry_picker(target, grp, year_month, days[0])
+        return
+    buttons = [
+        [InlineKeyboardButton(f"{d:02d}", callback_data=f"tdel:day:{grp}:{year_month}:{d}")]
+        for d in days
+    ]
+    await _reply_or_edit(
+        target, f"{month_label(year_month)} \u2014 which day?", reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+
+async def show_entry_picker(target, grp: str, year_month: str, day: int):
+    entries = get_entries_for_day(grp, year_month, day)
+    if not entries:
+        await _reply_or_edit(target, "No entries left for that day.")
+        return
+    if len(entries) == 1:
+        entry_id, entry_text = entries[0]
+        await show_delete_confirm(target, entry_id, entry_text)
+        return
+    buttons = [
+        [InlineKeyboardButton(truncate(text), callback_data=f"tdel:entry:{eid}")]
+        for eid, text in entries
+    ]
+    await _reply_or_edit(
+        target, f"{day:02d} {month_label(year_month)} \u2014 which entry?", reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+
+async def show_delete_confirm(target, entry_id: int, entry_text: str):
+    buttons = [[
+        InlineKeyboardButton("\U0001F5D1 Delete", callback_data=f"tdel:confirm:{entry_id}"),
+        InlineKeyboardButton("Cancel", callback_data="tdel:cancel"),
+    ]]
+    await _reply_or_edit(
+        target, f"Delete this entry?\n\n{entry_text}", reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+
+async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if not msg or msg.chat_id != CHAT_ID:
+        return
+    grp = next((g for g, tid in TRAVEL_GROUPS.items() if tid == msg.message_thread_id), None)
+    if not grp:
+        await msg.reply_text("Run /delete inside the JY or HYX travel topic to delete an entry there.")
+        return
+    await show_month_picker(msg, grp)
+
+
+async def on_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query or not query.data or not query.data.startswith("tdel:"):
+        return
+    if not query.message or query.message.chat_id != CHAT_ID:
+        return
+    await query.answer()
+
+    parts = query.data.split(":")
+    action = parts[1]
+
+    if action == "cancel":
+        await query.edit_message_text("Cancelled.")
+    elif action == "month":
+        grp, year_month = parts[2], parts[3]
+        await show_day_picker(query, grp, year_month)
+    elif action == "day":
+        grp, year_month, day = parts[2], parts[3], int(parts[4])
+        await show_entry_picker(query, grp, year_month, day)
+    elif action == "entry":
+        entry_id = int(parts[2])
+        entry_text = get_entry_text(entry_id)
+        if entry_text is None:
+            await query.edit_message_text("That entry no longer exists.")
+        else:
+            await show_delete_confirm(query, entry_id, entry_text)
+    elif action == "confirm":
+        entry_id = int(parts[2])
+        delete_entry(entry_id)
+        await query.edit_message_text("Deleted.")
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -681,9 +946,13 @@ MILEAGE_HELP_TEXT = (
 
 TRAVEL_HELP_TEXT = (
     "{grp} travel topic commands:\n"
-    "\u2022 Just send your trip, e.g. \"home > kc3 > home\" \u2014 logs it under today's date\n"
+    "\u2022 Just send your trip, e.g. \"home > kc3 > home\" \u2014 needs at least two \">\"s "
+    "or it's ignored (so random chat doesn't get logged)\n"
     "\u2022 \"yesterday ...\" / \"today ...\" / \"20 ...\" \u2014 logs under a specific date\n"
-    "\u2022 /summary \u2014 trips logged so far this month\n"
+    "\u2022 /summary \u2014 pick a month via buttons (up to 3 months kept)\n"
+    "\u2022 /summary 1 or /summary 2 \u2014 skip the buttons, go straight to N months back\n"
+    "\u2022 /summary 2026-07 \u2014 skip the buttons, go straight to a specific month\n"
+    "\u2022 /delete \u2014 pick a month/day/entry to delete via buttons\n"
     "\u2022 Reply with \"claim\" / \"claimed\" \u2014 marks all outstanding months as claimed\n"
     "\u2022 /topicid \u2014 show this topic's chat_id / thread_id\n"
     "\u2022 /help \u2014 show this message"
@@ -803,6 +1072,9 @@ def main():
     app.add_handler(CommandHandler("setpremium", cmd_setpremium))
     app.add_handler(CommandHandler("setcycle", cmd_setcycle))
     app.add_handler(CommandHandler("fixmileage", cmd_fixmileage))
+    app.add_handler(CommandHandler("delete", cmd_delete))
+    app.add_handler(CallbackQueryHandler(on_delete_callback, pattern="^tdel:"))
+    app.add_handler(CallbackQueryHandler(on_summary_callback, pattern="^tsum:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
     jq = app.job_queue
